@@ -68,7 +68,7 @@
 #ifndef DEFAULT_MQTT_HOST
     /* Default MQTT host broker to use,
      * when none is specified in the examples */
-    #define DEFAULT_MQTT_HOST   "test.mosquitto.org"
+    #define DEFAULT_MQTT_HOST   "localhost"
     /* "iot.eclipse.org" */
     /* "broker.emqx.io" */
     /* "broker.hivemq.com" */
