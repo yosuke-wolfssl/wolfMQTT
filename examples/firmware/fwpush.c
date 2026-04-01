@@ -26,6 +26,12 @@
 
 #include "wolfmqtt/mqtt_client.h"
 
+#if defined(USE_WINDOWS_API)
+    #include <windows.h>
+#elif !defined(NO_FILESYSTEM)
+    #include <unistd.h>
+#endif
+
 #if defined(ENABLE_MQTT_TLS)
     #if !defined(WOLFSSL_USER_SETTINGS) && !defined(USE_WINDOWS_API)
         #include <wolfssl/options.h>
@@ -73,6 +79,17 @@ static int mqtt_message_cb(MqttClient *client, MqttMessage *msg,
 
     /* Return negative to terminate publish processing */
     return MQTT_CODE_SUCCESS;
+}
+
+static void fwpush_publish_delay(void)
+{
+#if FIRMWARE_PUBLISH_DELAY_MS > 0
+    #ifdef USE_WINDOWS_API
+    Sleep(FIRMWARE_PUBLISH_DELAY_MS);
+    #else
+    usleep(FIRMWARE_PUBLISH_DELAY_MS * 1000);
+    #endif
+#endif
 }
 
 #if !defined(NO_FILESYSTEM)
@@ -220,6 +237,8 @@ static int fwpush_transfer_send(MQTTCtx* mqttCtx, FwpushTransfer* transfer)
             transfer->done = 1;
             break;
         }
+
+        fwpush_publish_delay();
 
         if (transfer->chunk_number == 0xFFFFU) {
             PRINTF("Firmware requires more than 65536 chunks");
