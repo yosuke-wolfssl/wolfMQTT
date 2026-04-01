@@ -27,14 +27,6 @@
 #define FIRMWARE_PUSH_CLIENT_ID "WolfMQTTFwPush"
 #define FIRMWARE_PUSH_DEF_FILE  "examples/zephyr_stripped_v2_signed.bin"
 
-/* Structure to pass into the publish callback
- * using the publish->ctx pointer */
-typedef struct FwpushCBdata_s {
-    const char *filename;
-    byte *data;
-    FILE *fp;
-} FwpushCBdata;
-
 /* Exposed functions */
 int fwpush_test(MQTTCtx *mqttCtx);
 

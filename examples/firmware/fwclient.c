@@ -32,22 +32,6 @@
         #include <wolfssl/options.h>
     #endif
     #include <wolfssl/wolfcrypt/settings.h>
-    #include <wolfssl/version.h>
-
-    /* The signature wrapper for this example was added in wolfSSL after 3.7.1 */
-    #if defined(LIBWOLFSSL_VERSION_HEX) && LIBWOLFSSL_VERSION_HEX > 0x03007001 \
-            && defined(HAVE_ECC) && !defined(NO_SIG_WRAPPER)
-        #undef  ENABLE_FIRMWARE_SIG
-        #define ENABLE_FIRMWARE_SIG
-    #endif
-#endif
-
-
-#if defined(ENABLE_FIRMWARE_SIG)
-#include <wolfssl/ssl.h>
-#include <wolfssl/wolfcrypt/ecc.h>
-#include <wolfssl/wolfcrypt/signature.h>
-#include <wolfssl/wolfcrypt/hash.h>
 #endif
 
 #include "fwclient.h"
@@ -63,108 +47,177 @@
 /* Locals */
 static int mStopRead = 0;
 static int mTestDone = 0;
-static byte* mFwBuf;
+static byte mMsgBuf[FIRMWARE_MAX_BUFFER];
 
+typedef struct FwClientTransfer_s {
+    word32 total_len;
+    word32 bytes_written;
+    word16 expected_chunk;
+    int active;
+#if !defined(NO_FILESYSTEM)
+    FILE* fp;
+#endif
+} FwClientTransfer;
 
-static int fwfile_save(const char* filePath, byte* fileBuf, int fileLen)
+static FwClientTransfer mTransfer;
+
+static void fw_transfer_reset(void)
 {
 #if !defined(NO_FILESYSTEM)
-    int ret = 0;
-    FILE* file = NULL;
-
-    /* Check arguments */
-    if (filePath == NULL || XSTRLEN(filePath) == 0 || fileLen == 0 ||
-        fileBuf == NULL) {
-        return EXIT_FAILURE;
+    if (mTransfer.fp != NULL) {
+        fclose(mTransfer.fp);
+        mTransfer.fp = NULL;
     }
-
-    /* Open file */
-    file = fopen(filePath, "wb");
-    if (file == NULL) {
-        PRINTF("File %s write error!", filePath);
-        ret = EXIT_FAILURE;
-        goto exit;
-    }
-
-    /* Save file */
-    ret = (int)fwrite(fileBuf, 1, fileLen, file);
-    if (ret != fileLen) {
-        PRINTF("Error reading file! %d", ret);
-        ret = EXIT_FAILURE;
-        goto exit;
-    }
-
-    PRINTF("Saved %d bytes to %s", fileLen, filePath);
-
-exit:
-    if (file) {
-        fclose(file);
-    }
-    return ret;
-
-#else
-    (void)filePath;
-    (void)fileBuf;
-    PRINTF("Firmware File Save: Len=%d (No Filesystem)", fileLen);
-    return fileLen;
 #endif
+    XMEMSET(&mTransfer, 0, sizeof(mTransfer));
 }
 
-static int fw_message_process(MQTTCtx *mqttCtx, byte* buffer, word32 len)
+static int fw_transfer_begin(MQTTCtx* mqttCtx, word32 total_len)
 {
-    int rc = 0;
-    FirmwareHeader* header = (FirmwareHeader*)buffer;
-    byte *sigBuf, *pubKeyBuf, *fwBuf;
-#ifdef ENABLE_FIRMWARE_SIG
-    ecc_key eccKey;
-#endif
-    word32 check_len = sizeof(FirmwareHeader) + header->sigLen +
-        header->pubKeyLen + header->fwLen;
-
-    /* Verify entire message was received */
-    if (len != check_len) {
-        PRINTF("Message header vs. actual size mismatch! %d != %d",
-            len, check_len);
+    if (mqttCtx == NULL || total_len == 0) {
         return EXIT_FAILURE;
     }
 
-    /* Get pointers to structure elements */
-    sigBuf = (buffer + sizeof(FirmwareHeader));
-    pubKeyBuf = (buffer + sizeof(FirmwareHeader) + header->sigLen);
-    fwBuf = (buffer + sizeof(FirmwareHeader) + header->sigLen +
-        header->pubKeyLen);
+    fw_transfer_reset();
+    mTransfer.total_len = total_len;
+    mTransfer.active = 1;
 
-#ifdef ENABLE_FIRMWARE_SIG
-    /* Import the public key */
-    wc_ecc_init(&eccKey);
-    rc = wc_ecc_import_x963(pubKeyBuf, header->pubKeyLen, &eccKey);
-    if (rc == 0) {
-        /* Perform signature verification using public key */
-        rc = wc_SignatureVerify(
-            FIRMWARE_HASH_TYPE, FIRMWARE_SIG_TYPE,
-            fwBuf, header->fwLen,
-            sigBuf, header->sigLen,
-            &eccKey, sizeof(eccKey));
-        PRINTF("Firmware Signature Verification: %s (%d)",
-            (rc == 0) ? "Pass" : "Fail", rc);
-#else
-        (void)pubKeyBuf;
-        (void)sigBuf;
+#if !defined(NO_FILESYSTEM)
+    mTransfer.fp = fopen(mqttCtx->pub_file, "wb");
+    if (mTransfer.fp == NULL) {
+        PRINTF("File %s open error", mqttCtx->pub_file);
+        fw_transfer_reset();
+        return EXIT_FAILURE;
+    }
 #endif
-        if (rc == 0) {
-            /* TODO: Process firmware image */
-            /* For example, save to disk using topic name */
-            fwfile_save(mqttCtx->pub_file, fwBuf, header->fwLen);
+
+    PRINTF("Firmware transfer started: total %u bytes", total_len);
+    return 0;
+}
+
+static int fw_transfer_write_chunk(const byte* chunk_data, word16 chunk_len)
+{
+#if !defined(NO_FILESYSTEM)
+    int written;
+#endif
+
+    if (!mTransfer.active || chunk_data == NULL || chunk_len == 0) {
+        return EXIT_FAILURE;
+    }
+
+#if !defined(NO_FILESYSTEM)
+    written = (int)fwrite(chunk_data, 1, chunk_len, mTransfer.fp);
+    if (written != chunk_len) {
+        PRINTF("Chunk file write error: %d", written);
+        return EXIT_FAILURE;
+    }
+#endif
+
+    mTransfer.bytes_written += chunk_len;
+
+    if (mTransfer.bytes_written > mTransfer.total_len) {
+        PRINTF("Chunk exceeds expected total length");
+        return EXIT_FAILURE;
+    }
+
+    return 0;
+}
+
+static int fw_transfer_finish(MQTTCtx* mqttCtx)
+{
+    (void)mqttCtx;
+
+    PRINTF("Firmware transfer complete: %u bytes", mTransfer.bytes_written);
+    fw_transfer_reset();
+
+    if (mqttCtx->test_mode) {
+        mTestDone = 1;
+    } else {
+        mStopRead = 1;
+    }
+
+    return 0;
+}
+
+static int fw_message_process(MQTTCtx *mqttCtx, const byte* buffer, word32 len)
+{
+    const MessageHeader* header;
+    const byte* payload;
+    word32 payload_len;
+
+    if (mqttCtx == NULL || buffer == NULL) {
+        return EXIT_FAILURE;
+    }
+
+    if (len < sizeof(MessageHeader)) {
+        PRINTF("Chunk too small: %u", len);
+        return EXIT_FAILURE;
+    }
+
+    header = (const MessageHeader*)buffer;
+    payload = buffer + sizeof(MessageHeader);
+    payload_len = len - sizeof(MessageHeader);
+
+    if (header->chunkSize != payload_len) {
+        PRINTF("Chunk size mismatch: header %u, payload %u",
+            header->chunkSize, payload_len);
+        return EXIT_FAILURE;
+    }
+
+    if (header->totalLen == 0) {
+        PRINTF("Invalid total length 0");
+        return EXIT_FAILURE;
+    }
+
+    if (header->chunkNumber == 0) {
+        if (fw_transfer_begin(mqttCtx, header->totalLen) != 0) {
+            return EXIT_FAILURE;
         }
-#ifdef ENABLE_FIRMWARE_SIG
     }
-    else {
-        PRINTF("ECC public key import failed! %d", rc);
-    }
-    wc_ecc_free(&eccKey);
-#endif
 
-    return rc;
+    if (!mTransfer.active) {
+        PRINTF("Received chunk without active transfer");
+        return EXIT_FAILURE;
+    }
+
+    if (header->totalLen != mTransfer.total_len) {
+        PRINTF("Transfer total length changed: %u -> %u",
+            mTransfer.total_len, header->totalLen);
+        fw_transfer_reset();
+        return EXIT_FAILURE;
+    }
+
+    if (header->chunkNumber < mTransfer.expected_chunk) {
+        /* Duplicate chunk from retransmit; ignore if already committed. */
+        PRINTF("Ignoring duplicate chunk %u", header->chunkNumber);
+        return 0;
+    }
+
+    if (header->chunkNumber != mTransfer.expected_chunk) {
+        PRINTF("Out-of-order chunk: expected %u, got %u",
+            mTransfer.expected_chunk, header->chunkNumber);
+        fw_transfer_reset();
+        return EXIT_FAILURE;
+    }
+
+    if (fw_transfer_write_chunk(payload, header->chunkSize) != 0) {
+        fw_transfer_reset();
+        return EXIT_FAILURE;
+    }
+
+    PRINTF("Firmware chunk %u: %u bytes (%u/%u)",
+        header->chunkNumber,
+        header->chunkSize,
+        mTransfer.bytes_written,
+        mTransfer.total_len);
+
+    mTransfer.expected_chunk++;
+
+    if (mTransfer.bytes_written == mTransfer.total_len) {
+        return fw_transfer_finish(mqttCtx);
+    }
+
+    return 0;
 }
 
 static int mqtt_message_cb(MqttClient *client, MqttMessage *msg,
@@ -172,41 +225,32 @@ static int mqtt_message_cb(MqttClient *client, MqttMessage *msg,
 {
     MQTTCtx* mqttCtx = (MQTTCtx*)client->ctx;
 
-    /* Verify this message is for the firmware topic */
-    if (msg_new &&
-        XSTRNCMP(msg->topic_name, mqttCtx->topic_name,
-            msg->topic_name_len) == 0 &&
-        !mFwBuf)
-    {
-        /* Allocate buffer for entire message */
-        /* Note: On an embedded system this could just be a write to flash.
-                 If writing to flash change FIRMWARE_MAX_BUFFER to match
-                 block size */
-        mFwBuf = (byte*)WOLFMQTT_MALLOC(msg->total_len);
-        if (mFwBuf == NULL) {
+    if (msg_new) {
+        if (XSTRNCMP(msg->topic_name, mqttCtx->topic_name,
+            msg->topic_name_len) != 0) {
+            return MQTT_CODE_SUCCESS;
+        }
+
+        if (msg->total_len > sizeof(mMsgBuf)) {
+            PRINTF("Incoming publish exceeds firmware message buffer: %u",
+                msg->total_len);
             return MQTT_CODE_ERROR_OUT_OF_BUFFER;
         }
 
-        /* Print incoming message */
-        PRINTF("MQTT Firmware Message: Qos %d, Len %u",
+        PRINTF("MQTT Firmware Chunk Message: Qos %d, Len %u",
             msg->qos, msg->total_len);
     }
 
-    if (mFwBuf) {
-        XMEMCPY(&mFwBuf[msg->buffer_pos], msg->buffer, msg->buffer_len);
+    if ((msg->buffer_pos + msg->buffer_len) > sizeof(mMsgBuf)) {
+        PRINTF("Incoming payload chunk exceeds message buffer");
+        return MQTT_CODE_ERROR_MALFORMED_DATA;
+    }
 
-        /* Process message if done */
-        if (msg_done) {
-            fw_message_process(mqttCtx, mFwBuf, msg->total_len);
+    XMEMCPY(&mMsgBuf[msg->buffer_pos], msg->buffer, msg->buffer_len);
 
-            /* Free */
-            WOLFMQTT_FREE(mFwBuf);
-            mFwBuf = NULL;
-
-            /* for test mode stop client */
-            if (mqttCtx->test_mode) {
-                mTestDone = 1;
-            }
+    if (msg_done) {
+        if (fw_message_process(mqttCtx, mMsgBuf, msg->total_len) != 0) {
+            return MQTT_CODE_ERROR_MALFORMED_DATA;
         }
     }
 
@@ -483,6 +527,8 @@ disconn:
 exit:
 
     if (rc != MQTT_CODE_CONTINUE) {
+        fw_transfer_reset();
+
         /* Free resources */
         if (mqttCtx->tx_buf) WOLFMQTT_FREE(mqttCtx->tx_buf);
         if (mqttCtx->rx_buf) WOLFMQTT_FREE(mqttCtx->rx_buf);
@@ -504,9 +550,7 @@ exit:
     static BOOL CtrlHandler(DWORD fdwCtrlType)
     {
         if (fdwCtrlType == CTRL_C_EVENT) {
-        #if defined(ENABLE_FIRMWARE_SIG)
             mStopRead = 1;
-        #endif
             PRINTF("Received Ctrl+c");
             return TRUE;
         }
@@ -517,9 +561,7 @@ exit:
     static void sig_handler(int signo)
     {
         if (signo == SIGINT) {
-        #if defined(ENABLE_FIRMWARE_SIG)
             mStopRead = 1;
-        #endif
             PRINTF("Received SIGINT");
         }
     }
