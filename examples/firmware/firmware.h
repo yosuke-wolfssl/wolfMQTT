@@ -30,7 +30,7 @@ extern "C" {
 #define FIRMWARE_MAX_BUFFER     2048
 #define FIRMWARE_MAX_PACKET     (int)(FIRMWARE_MAX_BUFFER + sizeof(MqttPacket) + XSTRLEN(FIRMWARE_TOPIC_NAME) + MQTT_DATA_LEN_SIZE)
 #define FIRMWARE_MQTT_QOS		MQTT_QOS_2
-#define FIRMWARE_PUBLISH_DELAY_MS 200
+#define FIRMWARE_PUBLISH_DELAY_MS 300
 
 typedef struct messageHeader {
     word16 chunkNumber;

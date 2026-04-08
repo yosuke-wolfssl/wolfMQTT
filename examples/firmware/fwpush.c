@@ -544,6 +544,8 @@ exit:
         if (signo == SIGINT) {
             mStopRead = 1;
             PRINTF("Received SIGINT");
+            (void)signal(SIGINT, SIG_DFL);
+            (void)raise(SIGINT);
         }
     }
 #endif
