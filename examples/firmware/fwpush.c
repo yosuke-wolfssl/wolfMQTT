@@ -50,6 +50,7 @@
 #endif
 
 #define FIRMWARE_CHUNK_DATA_MAX ((word32)(FIRMWARE_MAX_BUFFER - sizeof(MessageHeader)))
+#define ERASE_COMMAND_WAIT_MS   2000
 
 /* Locals */
 static int mStopRead = 0;
@@ -64,6 +65,9 @@ typedef struct FwpushTransfer_s {
     word16 chunk_payload_len;
     int chunk_ready;
     int done;
+    int erase_cmd_ready;
+    int erase_cmd_sent;
+    int erase_wait_done;
 } FwpushTransfer;
 #endif
 
@@ -91,6 +95,17 @@ static void fwpush_publish_delay(void)
     #endif
 #endif
 }
+
+#if !defined(NO_FILESYSTEM)
+static void fwpush_erase_wait(void)
+{
+#ifdef USE_WINDOWS_API
+    Sleep(ERASE_COMMAND_WAIT_MS);
+#else
+    usleep(ERASE_COMMAND_WAIT_MS * 1000);
+#endif
+}
+#endif
 
 #if !defined(NO_FILESYSTEM)
 static void fwpush_transfer_deinit(FwpushTransfer* transfer)
@@ -247,6 +262,48 @@ static int fwpush_transfer_send(MQTTCtx* mqttCtx, FwpushTransfer* transfer)
 
         transfer->chunk_number++;
     }
+
+    return MQTT_CODE_SUCCESS;
+}
+
+static int fwpush_send_erase_command(MQTTCtx* mqttCtx, FwpushTransfer* transfer)
+{
+    int rc;
+    CommandHeader* command;
+    MqttPublish* publish;
+
+    if (mqttCtx == NULL || transfer == NULL) {
+        return MQTT_CODE_ERROR_BAD_ARG;
+    }
+
+    publish = &mqttCtx->publish;
+
+    if (!transfer->erase_cmd_ready) {
+        command = (CommandHeader*)publish->buffer;
+        command->commandId = COMMAND_ID_ERASE;
+        command->commandLen = 0;
+
+        publish->topic_name = COMMAND_TOPIC_NAME;
+        publish->packet_id = mqtt_get_packetid();
+        publish->total_len = sizeof(CommandHeader);
+        publish->buffer_len = publish->total_len;
+        transfer->erase_cmd_ready = 1;
+    }
+
+    rc = MqttClient_Publish(&mqttCtx->client, publish);
+    if (rc == MQTT_CODE_CONTINUE) {
+        return rc;
+    }
+    if (rc != MQTT_CODE_SUCCESS) {
+        return rc;
+    }
+
+    transfer->erase_cmd_ready = 0;
+    transfer->erase_cmd_sent = 1;
+    publish->topic_name = mqttCtx->topic_name;
+    publish->buffer_len = FIRMWARE_MAX_BUFFER;
+
+    PRINTF("MQTT Command publish complete: ERASE");
 
     return MQTT_CODE_SUCCESS;
 }
@@ -432,6 +489,22 @@ int fwpush_test(MQTTCtx *mqttCtx)
             mqttCtx->stat = WMQ_PUB;
 
 #if !defined(NO_FILESYSTEM)
+            if (!transfer->erase_cmd_sent) {
+                rc = fwpush_send_erase_command(mqttCtx, transfer);
+                if (rc == MQTT_CODE_CONTINUE) {
+                    return rc;
+                }
+                if (rc != MQTT_CODE_SUCCESS) {
+                    goto disconn;
+                }
+            }
+
+            if (!transfer->erase_wait_done) {
+                PRINTF("Waiting %u ms after erase command...", ERASE_COMMAND_WAIT_MS);
+                fwpush_erase_wait();
+                transfer->erase_wait_done = 1;
+            }
+
             rc = fwpush_transfer_send(mqttCtx, transfer);
             if (rc == MQTT_CODE_CONTINUE) {
                 return rc;
